@@ -20,6 +20,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE DeriveAnyClass, DeriveGeneric #-}
+{-# LANGUAGE CPP #-}
 
 {-
     Data Flow Analysis on a Control Flow Graph.
@@ -58,6 +59,8 @@ module ShellCheck.CFGAnalysis (
     ,getIncomingState
     ,getOutgoingState
     ,doesPostDominate
+    ,variableMayBeDeclaredInteger
+    ,variableMayBeAssignedInteger
     ,ShellCheck.CFGAnalysis.runTests -- STRIP
     ) where
 
@@ -130,7 +133,7 @@ internalToExternal s =
             literalValue = Nothing
         }
     }
-    flatVars = M.unionsWith (\_ last -> last) $ map mapStorage [sGlobalValues s, sLocalValues s, sPrefixValues s]
+    flatVars = M.unions $ map mapStorage [sPrefixValues s, sLocalValues s, sGlobalValues s]
 
 -- Conveniently get the state before a token id
 getIncomingState :: CFGAnalysis -> Id -> Maybe ProgramState
@@ -151,6 +154,20 @@ doesPostDominate analysis target base = fromMaybe False $ do
     (_, baseEnd) <- M.lookup base $ tokenToRange analysis
     (targetStart, _) <- M.lookup target $ tokenToRange analysis
     return $ targetStart `elem` (postDominators analysis ! baseEnd)
+
+-- See if any execution path results in the variable containing a state
+variableMayHaveState :: ProgramState -> String -> CFVariableProp -> Maybe Bool
+variableMayHaveState state var property = do
+    value <- M.lookup var $ variablesInScope state
+    return $ any (S.member property) $ variableProperties value
+
+-- See if any execution path declares the variable an integer (declare -i).
+variableMayBeDeclaredInteger state var = variableMayHaveState state var CFVPInteger
+
+-- See if any execution path suggests the variable may contain an integer value
+variableMayBeAssignedInteger state var = do
+    value <- M.lookup var $ variablesInScope state
+    return $ (numericalStatus $ variableValue value) >= NumericalStatusMaybe
 
 getDataForNode analysis node = M.lookup node $ nodeToData analysis
 
@@ -282,7 +299,6 @@ depsToState set = foldl insert newInternalState $ S.toList set
                     PrefixScope -> (sPrefixValues, insertPrefix)
                     LocalScope -> (sLocalValues, insertLocal)
                     GlobalScope -> (sGlobalValues, insertGlobal)
-                    DefaultScope -> error $ pleaseReport "Unresolved scope in dependency"
 
             alreadyExists = isJust $ vmLookup name $ mapToCheck state
         in
@@ -433,6 +449,13 @@ data StackEntry s = StackEntry {
 }
     deriving (Eq, Generic, NFData)
 
+#if MIN_VERSION_deepseq(1,4,2)
+-- Our deepseq already has a STRef instance
+#else
+-- Older deepseq (for GHC < 8) lacks this instance
+instance NFData (STRef s a) where
+    rnf = (`seq` ())
+#endif
 
 -- Overwrite a base state with the contents of a diff state
 -- This is unrelated to join/merge.
@@ -649,7 +672,7 @@ vmPatch base diff =
         _ | vmIsQuickEqual base diff -> diff
         _ -> VersionedMap {
             mapVersion = -1,
-            mapStorage = M.unionWith (flip const) (mapStorage base) (mapStorage diff)
+            mapStorage = M.union (mapStorage diff) (mapStorage base)
         }
 
 -- Set a variable. This includes properties. Applies it to the appropriate scope.
@@ -806,7 +829,7 @@ lookupStack' functionOnly get dep def ctx key = do
     f (s:rest) = do
         -- Go up the stack until we find the value, and add
         -- a dependency on each state (including where it was found)
-        res <- fromMaybe (f rest) (return <$> get (stackState s) key)
+        res <- maybe (f rest) return (get (stackState s) key)
         modifySTRef (dependencies s) $ S.insert $ dep key res
         return res
 
@@ -1096,34 +1119,34 @@ transferEffect ctx effect =
 
         CFSetProps scope name props ->
             case scope of
-                DefaultScope -> do
+                Nothing -> do
                     state <- readVariable ctx name
                     writeVariable ctx name $ addProperties props state
-                GlobalScope -> do
+                Just GlobalScope -> do
                     state <- readGlobal ctx name
                     writeGlobal ctx name $ addProperties props state
-                LocalScope -> do
+                Just LocalScope -> do
                     out <- readSTRef (cOutput ctx)
                     state <- readLocal ctx name
                     writeLocal ctx name $ addProperties props state
-                PrefixScope -> do
+                Just PrefixScope -> do
                     -- Prefix values become local
                     state <- readLocal ctx name
                     writeLocal ctx name $ addProperties props state
 
         CFUnsetProps scope name props ->
             case scope of
-                DefaultScope -> do
+                Nothing -> do
                     state <- readVariable ctx name
                     writeVariable ctx name $ removeProperties props state
-                GlobalScope -> do
+                Just GlobalScope -> do
                     state <- readGlobal ctx name
                     writeGlobal ctx name $ removeProperties props state
-                LocalScope -> do
+                Just LocalScope -> do
                     out <- readSTRef (cOutput ctx)
                     state <- readLocal ctx name
                     writeLocal ctx name $ removeProperties props state
-                PrefixScope -> do
+                Just PrefixScope -> do
                     -- Prefix values become local
                     state <- readLocal ctx name
                     writeLocal ctx name $ removeProperties props state
@@ -1263,7 +1286,7 @@ dataflow ctx entry = do
             else do
                 let (next, rest) = S.deleteFindMin ps
                 nexts <- process states next
-                writeSTRef pending $ foldl (flip S.insert) rest nexts
+                writeSTRef pending $ S.union (S.fromList nexts) rest
                 f (n-1) pending states
 
     process states node = do
@@ -1327,7 +1350,7 @@ analyzeControlFlow params t =
 
         -- All nodes we've touched
         invocations <- readSTRef $ cInvocations ctx
-        let invokedNodes = M.fromDistinctAscList $ map (\c -> (c, ())) $ S.toList $ M.keysSet $ groupByNode $ M.map snd invocations
+        let invokedNodes = M.fromSet (const ()) $ S.unions $ map (M.keysSet . snd) $ M.elems invocations
 
         -- Invoke all functions that were declared but not invoked
         -- This is so that we still get warnings for dead code
@@ -1350,7 +1373,7 @@ analyzeControlFlow params t =
 
         -- Fill in the map with unreachable states for anything we didn't get to
         let baseStates = M.fromDistinctAscList $ map (\c -> (c, (unreachableState, unreachableState))) $ uncurry enumFromTo $ nodeRange $ cfGraph cfg
-        let allStates = M.unionWith (flip const) baseStates invokedStates
+        let allStates = M.union invokedStates baseStates
 
         -- Convert to external states
         let nodeToData = M.map (\(a,b) -> (internalToExternal a, internalToExternal b)) allStates
@@ -1391,7 +1414,7 @@ analyzeControlFlow params t =
     getFunctionTargets :: InternalState -> M.Map Node FunctionDefinition
     getFunctionTargets state =
         let
-            declaredFuncs = S.unions $ mapStorage $ sFunctionTargets state
+            declaredFuncs = S.unions $ M.elems $ mapStorage $ sFunctionTargets state
             getFunc d =
                 case d of
                     FunctionDefinition _ entry _ -> Just (entry, d)
